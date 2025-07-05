@@ -465,6 +465,7 @@ class Model(nn.Module):
         for step_ndx, data in tqdm(enumerate(X, 0), total=max_steps, desc="Training"):
             # get the inputs; data is a list of [inputs, labels]
             x, y = data[0].to(self.device), data[1].to(self.device)
+            x = x.to(next(self.model.parameters()).dtype)
             y_ = y[..., None].to(torch.float32)
 
             # Update learning rates

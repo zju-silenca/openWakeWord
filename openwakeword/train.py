@@ -894,16 +894,36 @@ if __name__ == '__main__':
             n_cpus = 1
         else:
             n_cpus = n_cpus//2
+
+        target_dtype_torch = torch.float16 if USE_FP16 else torch.float32
+        target_dtype_np = np.float16 if USE_FP16 else np.float32
+
+
         X_train = torch.utils.data.DataLoader(IterDataset(batch_generator),
                                               batch_size=None, num_workers=n_cpus, prefetch_factor=16)
-
-        X_val_fp = np.load(config["false_positive_validation_data_path"])
-        X_val_fp = np.array([X_val_fp[i:i+input_shape[0]] for i in range(0, X_val_fp.shape[0]-input_shape[0], 1)])  # reshape to match model
-        X_val_fp_labels = np.zeros(X_val_fp.shape[0]).astype(np.float32)
+        X_val_fp_data = np.load(config["false_positive_validation_data_path"])
+        
+        # 确保在 reshape 后，数据类型是我们期望的 np.float16
+        X_val_fp_data = np.array([X_val_fp_data[i:i+input_shape[0]] for i in range(0, X_val_fp_data.shape[0]-input_shape[0], 1)], 
+                                 dtype=target_dtype_np) 
+        
+        X_val_fp_labels = np.zeros(X_val_fp_data.shape[0], dtype=np.float32) # 标签保持fp32，用于计算loss
+        
         X_val_fp = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(torch.from_numpy(X_val_fp), torch.from_numpy(X_val_fp_labels)),
+            torch.utils.data.TensorDataset(
+                torch.from_numpy(X_val_fp_data).to(target_dtype_torch), # 显式转换特征
+                torch.from_numpy(X_val_fp_labels)
+            ),
             batch_size=len(X_val_fp_labels)
         )
+
+        # X_val_fp = np.load(config["false_positive_validation_data_path"])
+        # X_val_fp = np.array([X_val_fp[i:i+input_shape[0]] for i in range(0, X_val_fp.shape[0]-input_shape[0], 1)])  # reshape to match model
+        # X_val_fp_labels = np.zeros(X_val_fp.shape[0]).astype(np.float32)
+        # X_val_fp = torch.utils.data.DataLoader(
+        #     torch.utils.data.TensorDataset(torch.from_numpy(X_val_fp), torch.from_numpy(X_val_fp_labels)),
+        #     batch_size=len(X_val_fp_labels)
+        # )
 
         X_val_pos = np.load(os.path.join(feature_save_dir, "positive_features_test.npy"))
         X_val_neg = np.load(os.path.join(feature_save_dir, "negative_features_test.npy"))

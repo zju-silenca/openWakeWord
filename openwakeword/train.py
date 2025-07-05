@@ -462,49 +462,50 @@ class Model(nn.Module):
         accumulated_samples = 0
         accumulated_predictions = torch.Tensor([]).to(self.device)
         accumulated_labels = torch.Tensor([]).to(self.device)
+
+        # 初始化 GradScaler 仅当使用 FP16
+        use_amp = self.model.parameters().__next__().dtype == torch.float16
+        scaler = torch.amp.GradScaler(enabled=use_amp)
+
         for step_ndx, data in tqdm(enumerate(X, 0), total=max_steps, desc="Training"):
-            # get the inputs; data is a list of [inputs, labels]
             x, y = data[0].to(self.device), data[1].to(self.device)
             x = x.to(next(self.model.parameters()).dtype)
             y_ = y[..., None].to(torch.float32)
 
-            # Update learning rates
+            # 更新学习率
             for g in self.optimizer.param_groups:
                 g['lr'] = self.lr_warmup_cosine_decay(step_ndx, warmup_steps=warmup_steps, hold=hold_steps,
-                                                      total_steps=max_steps, target_lr=lr)
+                                                    total_steps=max_steps, target_lr=lr)
 
-            # zero the parameter gradients
             self.optimizer.zero_grad()
 
-            # Get predictions for batch
-            predictions = self.model(x)
+            # Get predictions for batch (with autocast)
+            with torch.amp.autocast(enabled=use_amp):
+                predictions = self.model(x)
 
-            # Construct batch with only samples that have high loss
-            neg_high_loss = predictions[(y == 0) & (predictions.squeeze() >= 0.001)]  # thresholds were chosen arbitrarily but work well
-            pos_high_loss = predictions[(y == 1) & (predictions.squeeze() < 0.999)]
-            y = torch.cat((y[(y == 0) & (predictions.squeeze() >= 0.001)], y[(y == 1) & (predictions.squeeze() < 0.999)]))
-            y_ = y[..., None].to(predictions.dtype)
-            predictions = torch.cat((neg_high_loss, pos_high_loss))
+                # 构造只保留高 loss 样本的子集
+                neg_high_loss = predictions[(y == 0) & (predictions.squeeze() >= 0.001)]
+                pos_high_loss = predictions[(y == 1) & (predictions.squeeze() < 0.999)]
+                y = torch.cat((y[(y == 0) & (predictions.squeeze() >= 0.001)],
+                            y[(y == 1) & (predictions.squeeze() < 0.999)]))
+                y_ = y[..., None].to(torch.float32)
+                predictions = torch.cat((neg_high_loss, pos_high_loss))
 
-            # Set weights for batch
-            if len(negative_weight_schedule) == 1:
-                w = torch.ones(y.shape[0])*negative_weight_schedule[0]
-                pos_ndcs = y == 1
-                w[pos_ndcs] = 1
-                w = w[..., None]
-            else:
-                if self.n_classes == 1:
-                    w = torch.ones(y.shape[0])*negative_weight_schedule[step_ndx]
-                    pos_ndcs = y == 1
-                    w[pos_ndcs] = 1
-                    w = w[..., None]
-            w = w.to(predictions.dtype)
+                # 设置权重
+                if len(negative_weight_schedule) == 1:
+                    w = torch.ones(y.shape[0]) * negative_weight_schedule[0]
+                    w[y == 1] = 1
+                else:
+                    w = torch.ones(y.shape[0]) * negative_weight_schedule[step_ndx]
+                    w[y == 1] = 1
+                w = w[..., None].to(torch.float32)
+
+                if predictions.shape[0] != 0:
+                    loss = self.loss(predictions.to(torch.float32), y_, w.to(self.device))
+                    loss = loss / accumulation_steps
+
+            # 梯度缩放 + 反向传播
             if predictions.shape[0] != 0:
-                # Do backpropagation, with gradient accumulation if the batch-size after selecting high loss examples is too small
-                loss = self.loss(predictions, y_ if self.n_classes == 1 else y, w.to(self.device))
-                loss = loss/accumulation_steps
-                accumulated_samples += predictions.shape[0]
-
                 if predictions.shape[0] >= 128:
                     accumulated_predictions = predictions
                     accumulated_labels = y_
@@ -513,15 +514,14 @@ class Model(nn.Module):
                     accumulated_predictions = torch.cat((accumulated_predictions, predictions))
                     accumulated_labels = torch.cat((accumulated_labels, y_))
                 else:
-                    loss.backward()
-                    self.optimizer.step()
+                    scaler.scale(loss).backward()
+                    scaler.step(self.optimizer)
+                    scaler.update()
                     accumulation_steps = 1
                     accumulated_samples = 0
 
                     self.history["loss"].append(loss.detach().cpu().numpy())
-
-                    # Compute training metrics and log them
-                    fp = self.fp(accumulated_predictions, accumulated_labels if self.n_classes == 1 else y)
+                    fp = self.fp(accumulated_predictions, accumulated_labels)
                     self.n_fp += fp
                     self.history["recall"].append(self.recall(accumulated_predictions, accumulated_labels).detach().cpu().numpy())
 

@@ -134,6 +134,12 @@ class Model(nn.Module):
         self.loss = torch.nn.functional.binary_cross_entropy if n_classes == 1 else nn.functional.cross_entropy
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
 
+    def to_fp16(self):
+        """Converts the model's parameters and buffers to FP16."""
+        print("Converting wakeword model to float16...")
+        self.model.to(torch.float16) # .half()是to(torch.float16)的快捷方式
+        return self
+
     def save_model(self, output_path):
         """
         Saves the weights of a trained Pytorch model
@@ -416,18 +422,30 @@ class Model(nn.Module):
 
         return preds
 
-    def export_model(self, model, model_name, output_dir):
+    def export_model(self, model, model_name, output_dir, use_fp16=False):
         """Saves the trained openwakeword model to both onnx and tflite formats"""
 
         if self.n_classes != 1:
             raise ValueError("Exporting models to both onnx and tflite with more than one class is currently not supported! "
                              "Use the `export_to_onnx` function instead.")
 
+        # --- 修改：根据 use_fp16 准备模型和输入 ---
+        target_dtype = torch.float16 if use_fp16 else torch.float32
+        
         # Save ONNX model
-        logging.info(f"####\nSaving ONNX mode as '{os.path.join(output_dir, model_name + '.onnx')}'")
+        logging.info(f"####\nSaving ONNX model as '{os.path.join(output_dir, model_name + '.onnx')}' with dtype {target_dtype}")
         model_to_save = copy.deepcopy(model)
-        torch.onnx.export(model_to_save.to("cpu"), torch.rand(self.input_shape)[None, ],
-                          os.path.join(output_dir, model_name + ".onnx"), opset_version=13)
+        
+        if use_fp16:
+            model_to_save.to(torch.float16) # 确保模型本身是FP16
+            model_name += "_fp16"
+            
+        # 准备一个正确类型的随机输入张量
+        dummy_input = torch.rand(self.input_shape)[None, ].to(target_dtype)
+        
+        torch.onnx.export(model_to_save.to("cpu"), dummy_input.to("cpu"), # 确保都在CPU上
+                          os.path.join(output_dir, model_name + ".onnx"), 
+                          opset_version=13)
 
         return None
 
@@ -633,6 +651,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     config = yaml.load(open(args.training_config, 'r').read(), yaml.Loader)
+    # --- 新增一个配置项，用于控制是否使用FP16 ---
+    USE_FP16 = config.get("use_fp16", False) # 从config.yaml获取，默认为False
 
     # imports Piper for synthetic sample generation
     sys.path.insert(0, os.path.abspath(config["piper_sample_generator_path"]))
@@ -784,39 +804,52 @@ if __name__ == '__main__':
                 n_cpus = 1
             else:
                 n_cpus = n_cpus//2
+            print(f"Initializing AudioFeatures with use_fp16={USE_FP16}")
+            audio_features_computer = AudioFeatures(
+                device="gpu" if torch.cuda.is_available() else "cpu",
+                ncpu=0 if not torch.cuda.is_available() else 1,
+                use_fp16=USE_FP16  # <<<<<<< 关键修改
+            )
             compute_features_from_generator(positive_clips_train_generator, n_total=len(os.listdir(positive_train_output_dir)),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "positive_features_train.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
+                                            ncpu=n_cpus if not torch.cuda.is_available() else 1,
+                                            audio_features_instance=audio_features_computer)
 
             compute_features_from_generator(negative_clips_train_generator, n_total=len(os.listdir(negative_train_output_dir)),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "negative_features_train.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
+                                            ncpu=n_cpus if not torch.cuda.is_available() else 1,
+                                            audio_features_instance=audio_features_computer)
 
             compute_features_from_generator(positive_clips_test_generator, n_total=len(os.listdir(positive_test_output_dir)),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "positive_features_test.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
+                                            ncpu=n_cpus if not torch.cuda.is_available() else 1,
+                                            audio_features_instance=audio_features_computer)
 
             compute_features_from_generator(negative_clips_test_generator, n_total=len(os.listdir(negative_test_output_dir)),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "negative_features_test.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
+                                            ncpu=n_cpus if not torch.cuda.is_available() else 1,
+                                            audio_features_instance=audio_features_computer)
+            logging.info("#"*50 + "\nFinished computing openwakeword features for generated samples\n" + "#"*50)
         else:
             logging.warning("Openwakeword features already exist, skipping data augmentation and feature generation")
 
     # Create openwakeword model
     if args.train_model is True:
-        F = openwakeword.utils.AudioFeatures(device='cpu')
+        # F = openwakeword.utils.AudioFeatures(device='cpu')
         input_shape = np.load(os.path.join(feature_save_dir, "positive_features_test.npy")).shape[1:]
 
         oww = Model(n_classes=1, input_shape=input_shape, model_type=config["model_type"],
                     layer_dim=config["layer_size"], seconds_per_example=1280*input_shape[0]/16000)
+        if USE_FP16:
+            oww.to_fp16()
 
         # Create data transform function for batch generation to handle differ clip lengths (todo: write tests for this)
         def f(x, n=input_shape[0]):
@@ -895,7 +928,7 @@ if __name__ == '__main__':
         )
 
         # Export the trained model to onnx
-        oww.export_model(model=best_model, model_name=config["model_name"], output_dir=config["output_dir"])
+        oww.export_model(model=best_model, model_name=config["model_name"], output_dir=config["output_dir"], use_fp16=USE_FP16)
 
         # Convert the model from onnx to tflite format
         convert_onnx_to_tflite(os.path.join(config["output_dir"], config["model_name"] + ".onnx"),

@@ -41,7 +41,8 @@ class AudioFeatures():
                  sr: int = 16000,
                  ncpu: int = 1,
                  inference_framework: str = "onnx",
-                 device: str = 'cpu'
+                 device: str = 'cpu',
+                 use_fp16: bool = False
                  ):
         """
         Initialize the AudioFeatures object.
@@ -60,6 +61,9 @@ class AudioFeatures():
                           this setting may not have an effect. For example, to use a GPU with the ONNX
                           framework the appropriate onnxruntime package must be installed.
         """
+        # --- 新增属性 ---
+        self.use_fp16 = use_fp16
+        self.target_dtype = np.float16 if use_fp16 else np.float32
         # Initialize the models with the appropriate framework
         if inference_framework == "onnx":
             try:
@@ -68,9 +72,13 @@ class AudioFeatures():
                 raise ValueError("Tried to import onnxruntime, but it was not found. Please install it using `pip install onnxruntime`")
 
             if melspec_model_path == "":
-                melspec_model_path = os.path.join(pathlib.Path(__file__).parent.resolve(), "resources", "models", "melspectrogram.onnx")
+                # --- 修改：根据 use_fp16 选择模型文件 ---
+                model_suffix = "_fp16.onnx" if self.use_fp16 else ".onnx"
+                melspec_model_path = os.path.join(pathlib.Path(__file__).parent.resolve(), "resources", "models", "melspectrogram" + model_suffix)
             if embedding_model_path == "":
-                embedding_model_path = os.path.join(pathlib.Path(__file__).parent.resolve(), "resources", "models", "embedding_model.onnx")
+                # --- 修改：根据 use_fp16 选择模型文件 ---
+                model_suffix = "_fp16.onnx" if self.use_fp16 else ".onnx"
+                embedding_model_path = os.path.join(pathlib.Path(__file__).parent.resolve(), "resources", "models", "embedding_model" + model_suffix)
 
             if ".tflite" in melspec_model_path or ".tflite" in embedding_model_path:
                 raise ValueError("The onnx inference framework is selected, but tflite models were provided!")
@@ -196,7 +204,8 @@ class AudioFeatures():
             raise ValueError("Input data must be 16-bit integers (i.e., 16-bit PCM audio)."
                              f"You provided {x.dtype} data.")
         x = x[None, ] if len(x.shape) < 2 else x
-        x = x.astype(np.float32) if x.dtype != np.float32 else x
+        x = x.astype(self.target_dtype) if x.dtype != self.target_dtype else x
+        # x = x.astype(np.float32) if x.dtype != np.float32 else x
 
         # Get melspectrogram
         outputs = self.melspec_model_predict(x)
@@ -231,7 +240,7 @@ class AudioFeatures():
             if window.shape[0] == window_size:  # truncate short windows
                 windows.append(window)
 
-        batch = np.expand_dims(np.array(windows), axis=-1).astype(np.float32)
+        batch = np.expand_dims(np.array(windows), axis=-1).astype(self.target_dtype)
         embedding = self.embedding_model_predict(batch)
         return embedding
 
@@ -269,7 +278,7 @@ class AudioFeatures():
         # Make batches
         n_frames = int(np.ceil(x.shape[1]/160-3))
         mel_bins = 32  # fixed by melspectrogram model
-        melspecs = np.empty((x.shape[0], n_frames, mel_bins), dtype=np.float32)
+        melspecs = np.empty((x.shape[0], n_frames, mel_bins), dtype=self.target_dtype)
         for i in range(0, max(batch_size, x.shape[0]), batch_size):
             batch = x[i:i+batch_size]
 
@@ -321,7 +330,7 @@ class AudioFeatures():
         # Calculate array sizes and make batches
         n_frames = (x.shape[1] - 76)//8 + 1
         embedding_dim = 96  # fixed by embedding model
-        embeddings = np.empty((x.shape[0], n_frames, embedding_dim), dtype=np.float32)
+        embeddings = np.empty((x.shape[0], n_frames, embedding_dim), dtype=self.target_dtype)
 
         batch = []
         ndcs = []
@@ -334,7 +343,7 @@ class AudioFeatures():
             ndcs.append(ndx)
 
             if len(batch) >= batch_size or ndx+1 == x.shape[0]:
-                batch = np.array(batch).astype(np.float32)
+                batch = np.array(batch).astype(self.target_dtype)
                 if "CUDA" in self.onnx_execution_provider:
                     result = self.embedding_model_predict(batch)
 
@@ -437,7 +446,7 @@ class AudioFeatures():
             for i in np.arange(self.accumulated_samples//1280-1, -1, -1):
                 ndx = -8*i
                 ndx = ndx if ndx != 0 else len(self.melspectrogram_buffer)
-                x = self.melspectrogram_buffer[-76 + ndx:ndx].astype(np.float32)[None, :, :, None]
+                x = self.melspectrogram_buffer[-76 + ndx:ndx].astype(self.target_dtype)[None, :, :, None]
                 if x.shape[1] == 76:
                     self.feature_buffer = np.vstack((self.feature_buffer,
                                                     self.embedding_model_predict(x)))
@@ -455,9 +464,9 @@ class AudioFeatures():
         if start_ndx != -1:
             end_ndx = start_ndx + int(n_feature_frames) \
                 if start_ndx + n_feature_frames != 0 else len(self.feature_buffer)
-            return self.feature_buffer[start_ndx:end_ndx, :][None, ].astype(np.float32)
+            return self.feature_buffer[start_ndx:end_ndx, :][None, ].astype(self.target_dtype)
         else:
-            return self.feature_buffer[int(-1*n_feature_frames):, :][None, ].astype(np.float32)
+            return self.feature_buffer[int(-1*n_feature_frames):, :][None, ].astype(self.target_dtype)
 
     def __call__(self, x):
         return self._streaming_features(x)
@@ -539,7 +548,7 @@ def bulk_predict(
     return {list(i.keys())[0]: list(i.values())[0] for i in results}
 
 
-def compute_features_from_generator(generator, n_total, clip_duration, output_file, device="cpu", ncpu=1):
+def compute_features_from_generator(generator, n_total, clip_duration, output_file, device="cpu", ncpu=1, audio_features_instance: AudioFeatures = None):
     """
     Computes audio features from a generator that produces Numpy arrays of shape (batch_size, samples)
     containing 16-bit PCM audio data.
@@ -563,12 +572,15 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
     from openwakeword.data import trim_mmap
 
     # Create audio features object
-    F = AudioFeatures(device=device)
+    if audio_features_instance is None:
+        F = AudioFeatures(device=device)
+    else:
+        F = audio_features_instance
 
     # Determine the output shape and create output file
     n_feature_cols = F.get_embedding_shape(clip_duration/16000)
     output_shape = (n_total, n_feature_cols[0], n_feature_cols[1])
-    fp = open_memmap(output_file, mode='w+', dtype=np.float32, shape=output_shape)
+    fp = open_memmap(output_file, mode='w+', dtype=self.target_dtype, shape=output_shape)
 
     # Get batch size by pulling one value from the generator and store features
     row_counter = 0

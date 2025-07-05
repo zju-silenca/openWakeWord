@@ -483,7 +483,7 @@ class Model(nn.Module):
             neg_high_loss = predictions[(y == 0) & (predictions.squeeze() >= 0.001)]  # thresholds were chosen arbitrarily but work well
             pos_high_loss = predictions[(y == 1) & (predictions.squeeze() < 0.999)]
             y = torch.cat((y[(y == 0) & (predictions.squeeze() >= 0.001)], y[(y == 1) & (predictions.squeeze() < 0.999)]))
-            y_ = y[..., None].to(torch.float32)
+            y_ = y[..., None].to(predictions.dtype)
             predictions = torch.cat((neg_high_loss, pos_high_loss))
 
             # Set weights for batch
@@ -498,7 +498,7 @@ class Model(nn.Module):
                     pos_ndcs = y == 1
                     w[pos_ndcs] = 1
                     w = w[..., None]
-
+            w = w.to(predictions.dtype)
             if predictions.shape[0] != 0:
                 # Do backpropagation, with gradient accumulation if the batch-size after selecting high loss examples is too small
                 loss = self.loss(predictions, y_ if self.n_classes == 1 else y, w.to(self.device))

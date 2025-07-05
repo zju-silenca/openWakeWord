@@ -580,7 +580,7 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
     # Determine the output shape and create output file
     n_feature_cols = F.get_embedding_shape(clip_duration/16000)
     output_shape = (n_total, n_feature_cols[0], n_feature_cols[1])
-    fp = open_memmap(output_file, mode='w+', dtype=self.target_dtype, shape=output_shape)
+    fp = open_memmap(output_file, mode='w+', dtype=F.target_dtype, shape=output_shape)
 
     # Get batch size by pulling one value from the generator and store features
     row_counter = 0

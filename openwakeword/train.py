@@ -480,7 +480,7 @@ class Model(nn.Module):
             self.optimizer.zero_grad()
 
             # Get predictions for batch (with autocast)
-            with torch.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type=self.device.type, enabled=use_amp):
                 predictions = self.model(x)
 
                 # 构造只保留高 loss 样本的子集
